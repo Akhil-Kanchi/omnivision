@@ -26,6 +26,8 @@ from google.genai import types
 from ohmlet_live_agent import agent
 from ohmlet_live_agent.interview_agent import interview_agent
 from ohmlet_live_agent.tools import set_priority_models
+from procedures import get_procedure
+from visual_verification import verify_action
 import interview as interview_mod
 from state_store import router as state_router
 from account import router as account_router
@@ -125,11 +127,39 @@ def health() -> dict[str, str]:
     }
 
 
+@app.get("/v1/procedures/{product_id}/{action}")
+def procedure(product_id: str, action: str) -> dict[str, object]:
+    if action not in {"assemble", "disassemble"}:
+        raise HTTPException(status_code=400, detail="Unsupported procedure action")
+    return {"product_id": product_id, "action": action, "steps": get_procedure(product_id, action)}
+
+
+@app.post("/v1/verify-action")
+async def verify_action_endpoint(payload: dict, user_id: str = Depends(require_uid)) -> dict[str, object]:
+    del user_id
+    frame_b64 = payload.get("frame")
+    product_id = str(payload.get("product_id", ""))[:80]
+    product = str(payload.get("product", product_id))[:120]
+    action_name = str(payload.get("action", "disassemble"))[:40]
+    step_id = int(payload.get("step_id", 0) or 0)
+    steps = get_procedure(product_id, action_name)
+    step = next((item for item in steps if item.get("id") == step_id), None)
+    if not step or not isinstance(frame_b64, str):
+        raise HTTPException(status_code=422, detail="A valid procedure step and camera frame are required")
+    try:
+        frame = base64.b64decode(frame_b64, validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Invalid camera frame")
+    if not validation.ws_image_ok(len(frame)):
+        raise HTTPException(status_code=413, detail="Camera frame is too large")
+    return verify_action(frame, product, step, payload.get("previous_state"))
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _is_native_audio_model() -> bool:
     model = os.getenv("OHMLET_LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
-    return "native-audio" in model
+    return "native-audio" in model or "live" in model
 
 
 async def _reject_ws(websocket: WebSocket, code: str, message: str) -> None:
@@ -257,7 +287,9 @@ async def websocket_endpoint(
         )
         logger.info("Created new ADK session: %s", session_id)
 
-    current_stage = "inventory"
+    current_stage = "inspect"
+    current_product = "hardware"
+    current_action = "disassemble"
     run_config = _build_run_config(current_stage)
     live_queue = LiveRequestQueue()
     meter = UsageMeter(user_id=user_id, session_id=session_id)
@@ -265,7 +297,7 @@ async def websocket_endpoint(
     # ── Upstream: client → Gemini ──────────────────────────────────────────────
 
     async def upstream() -> None:
-        nonlocal current_stage
+        nonlocal current_stage, current_product, current_action
         try:
             while True:
                 raw = await websocket.receive()
@@ -304,9 +336,41 @@ async def websocket_endpoint(
                         current_stage = validation.normalize_stage(msg.get("stage"), current_stage)
                         stage_content = types.Content(
                             role="user",
-                            parts=[types.Part(text=f"[stage changed to {current_stage}]")],
+                            parts=[
+                                types.Part(
+                                    text=(
+                                        f"[stage changed to {current_stage}] "
+                                        f"[product={current_product}] [action={current_action}]"
+                                    )
+                                )
+                            ],
                         )
                         live_queue.send_content(stage_content)
+                        continue
+
+                    if msg_type == "product_context":
+                        product = validation.validate_ws_text(msg.get("product", ""))[:120]
+                        action = validation.validate_ws_text(msg.get("action", ""))[:40]
+                        if product:
+                            current_product = product
+                        if action in {"assemble", "disassemble"}:
+                            current_action = action
+                        live_queue.send_content(
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part(
+                                        text=(
+                                            "[session context] "
+                                            f"Product or device: {current_product}. "
+                                            f"Task: {current_action}. "
+                                            "Continuously inspect camera frames and guide the user step by step. "
+                                            "Ask before each irreversible or risky step."
+                                        )
+                                    )
+                                ],
+                            )
+                        )
                         continue
 
                     if msg_type == "interview_context" and mode == "interview":
@@ -328,7 +392,11 @@ async def websocket_endpoint(
                         text = validation.validate_ws_text(msg.get("text", ""))  # capped length (#45)
                         if text:
                             # Interview mode has no tutor stages; send the turn as-is.
-                            prefixed = text if mode == "interview" else f"[stage={current_stage}] {text}"
+                            prefixed = (
+                                text
+                                if mode == "interview"
+                                else f"[stage={current_stage}] [product={current_product}] [action={current_action}] {text}"
+                            )
                             content = types.Content(
                                 role="user",
                                 parts=[types.Part(text=prefixed)],

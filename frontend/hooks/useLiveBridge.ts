@@ -60,6 +60,7 @@ type UseLiveBridgeReturn = {
   grabFrame: (maxWidth?: number) => Promise<string | null>;
   sendText: (text: string, stage: string) => void;
   sendStageUpdate: (stage: string) => void;
+  sendSessionContext: (context: Record<string, unknown>) => void;
   videoRef: React.RefObject<HTMLVideoElement>;
 };
 
@@ -231,8 +232,10 @@ export function useLiveBridge({
       // from it (#44), so the connection cannot impersonate another user. Sent
       // before any audio/text frame; harmlessly ignored by the legacy backend.
       void getIdToken().then((token) => {
-        if (token && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'auth', token }));
+        // Tutor-only local mode uses a deliberately non-production token.
+        const authToken = token || (import.meta.env.VITE_LOCAL_TUTOR === 'true' ? 'local-dev-token' : null);
+        if (authToken && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'auth', token: authToken }));
           // After auth, let the caller prime the session (e.g. interview context),
           // guaranteeing it arrives after the auth frame.
           onReadyRef.current?.((obj: unknown) => {
@@ -520,6 +523,11 @@ export function useLiveBridge({
     wsRef.current.send(JSON.stringify({ type: 'stage', stage }));
   }, []);
 
+  const sendSessionContext = useCallback((context: Record<string, unknown>) => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+    wsRef.current.send(JSON.stringify({ type: 'product_context', ...context }));
+  }, []);
+
   // ── Auto-connect ──
 
   useEffect(() => {
@@ -545,6 +553,7 @@ export function useLiveBridge({
     grabFrame,
     sendText,
     sendStageUpdate,
+    sendSessionContext,
     videoRef,
   };
 }

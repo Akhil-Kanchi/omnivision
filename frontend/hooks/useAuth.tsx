@@ -73,10 +73,12 @@ export interface AuthValue {
 const AuthContext = createContext<AuthValue | null>(null);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
+  const localTutor = import.meta.env.VITE_LOCAL_TUTOR === 'true';
+  const [user, setUser] = useState<User | null>(localTutor ? ({ uid: 'local-tutor', email: 'local@localhost', displayName: 'Local Tutor' } as User) : null);
+  const [loading, setLoading] = useState(localTutor ? false : true);
 
   useEffect(() => {
+    if (localTutor) return;
     const unsub = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setLoading(false);

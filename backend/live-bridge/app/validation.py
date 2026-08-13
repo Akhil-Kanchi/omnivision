@@ -24,7 +24,16 @@ MAX_STATE_BYTES = int(os.getenv("OHMLET_MAX_STATE_BYTES", str(200 * 1024)))     
 MAX_WS_TEXT_CHARS = int(os.getenv("OHMLET_MAX_WS_TEXT_CHARS", "4000"))           # a chat turn
 MAX_WS_IMAGE_BYTES = int(os.getenv("OHMLET_MAX_WS_IMAGE_BYTES", str(3 * 1024 * 1024)))  # 3 MB decoded frame
 
-VALID_STAGES = {"inventory", "wiring", "code", "test"}
+VALID_STAGES = {
+    "inventory",
+    "wiring",
+    "code",
+    "test",
+    "inspect",
+    "disassemble",
+    "assemble",
+    "validate",
+}
 
 
 def _too_large(label: str, size: int, limit: int) -> HTTPException:

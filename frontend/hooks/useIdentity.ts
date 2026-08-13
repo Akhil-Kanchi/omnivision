@@ -43,6 +43,6 @@ export function useIdentity(): Identity {
     }
 
     const effectiveAdmin = isAdmin && view !== 'guest';
-    return { userId: user?.uid ?? '', isAdmin: effectiveAdmin };
+    return { userId: user?.uid ?? (import.meta.env.VITE_LOCAL_TUTOR === 'true' ? 'local-tutor' : ''), isAdmin: effectiveAdmin };
   }, [user?.uid, isAdmin]);
 }

@@ -41,6 +41,8 @@ LIVE_MINUTES_PER_MONTH: dict[str, float] = {
     "pro": float(os.getenv("OHMLET_LIVE_MIN_PRO", "600")),   # 10 hours
     "max": float(os.getenv("OHMLET_LIVE_MIN_MAX", "1800")),  # 30 hours
 }
+if os.getenv("OHMLET_LOCAL_TUTOR", "").lower() == "true":
+    LIVE_MINUTES_PER_MONTH["free"] = float("inf")
 
 # Plans that get the premium models for code gen / deep reasoning tools.
 _PRIORITY_PLANS = {"pro", "max"}
@@ -79,6 +81,8 @@ def _budget_doc_id(user_id: str) -> str:
 
 def get_plan(user_id: str) -> str:
     """Read the user's plan from Firestore; default 'free'. Never raises."""
+    if os.getenv("OHMLET_LOCAL_TUTOR", "").lower() == "true":
+        return "free"
     try:
         from state_store import get_client
 
@@ -144,6 +148,8 @@ def uid_for_customer(customer_id: str | None) -> str | None:
 
 def live_seconds_used_this_period(user_id: str) -> float:
     """Live seconds the user has consumed this month (0 on any error)."""
+    if os.getenv("OHMLET_LOCAL_TUTOR", "").lower() == "true":
+        return 0.0
     try:
         from state_store import get_client
 

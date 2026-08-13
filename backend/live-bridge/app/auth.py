@@ -41,6 +41,10 @@ def _ensure_app() -> bool:
 
 def verify_id_token(token: str) -> dict:
     """Verify a Firebase ID token and return its decoded claims, or raise 401."""
+    # Local tutor-only mode deliberately avoids Firebase/GCP credentials. This
+    # is opt-in and must never be enabled in deployment.
+    if os.getenv("OHMLET_LOCAL_TUTOR", "").lower() == "true" and token.strip() == "local-dev-token":
+        return {"uid": os.getenv("OHMLET_LOCAL_USER_ID", "local-tutor"), "email": "local@localhost"}
     _ensure_app()
     if not token or not token.strip():
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing credentials")

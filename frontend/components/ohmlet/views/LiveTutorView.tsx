@@ -1,24 +1,24 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Box,
   Camera,
   CameraOff,
   CheckCircle2,
   ChevronRight,
-  CircleHelp,
   Cpu,
   Focus,
-  Loader2,
   Lock,
   Mic,
   MicOff,
+  MousePointer2,
   PhoneOff,
+  Smartphone,
   Radio,
   RefreshCw,
   ScanLine,
+  ShieldAlert,
+  SquarePlus,
   Volume2,
   Wrench,
-  XCircle,
   Zap,
 } from 'lucide-react';
 import { useLiveBridge } from '../../../hooks/useLiveBridge';
@@ -26,23 +26,15 @@ import { track } from '../../../services/analytics';
 import { usePlan } from '../../../hooks/usePlan';
 import { useIdentity } from '../../../hooks/useIdentity';
 import { LIVE_MINUTES_PER_MONTH, PLAN_META } from '../entitlements';
-import { BUILD_LIBRARY } from '../data/library';
-import {
-  verifyInventory,
-  verifierConfigured,
-  VerifierError,
-  type InventoryResult,
-  type PartStatus,
-} from '../../../services/visionVerifier';
-import { reporterConfigured } from '../../../services/reporter';
-import { TwinStudio } from '../twin/TwinStudio';
+import { getAssemblyProcedure, verifyAssemblyAction, type ProcedureStep, type VerificationResult } from '../../../services/assemblyTutor';
 
 /**
  * LiveTutorView — the live bench session. The camera feed is the hero; voice
  * is the primary channel. The learner points a camera at their breadboard and
- * the tutor sees it, talks them through wiring, and corrects mistakes live.
+ * the tutor sees it, talks them through assembly/disassembly, and corrects
+ * mistakes live.
  *
- * Stages mirror the core learning loop: inventory → wiring → code → test.
+ * Stages mirror physical repair flow: inspect → disassemble → assemble → validate.
  */
 
 interface LiveTutorViewProps {
@@ -52,28 +44,60 @@ interface LiveTutorViewProps {
   onUpgrade?: () => void;
 }
 
-type Stage = 'inventory' | 'wiring' | 'code' | 'test';
+type Stage = 'inspect' | 'disassemble' | 'assemble' | 'validate';
+type ProductId = 'mouse' | 'phone' | 'cpu' | 'custom';
+type RepairAction = 'disassemble' | 'assemble';
 
 const STAGES: Array<{ id: Stage; label: string; icon: React.ComponentType<{ className?: string }>; hint: string }> = [
-  { id: 'inventory', label: 'Inventory', icon: ScanLine, hint: 'Show me your parts so I can check the kit.' },
-  { id: 'wiring', label: 'Wiring', icon: Wrench, hint: 'Place each component and I will watch the board.' },
-  { id: 'code', label: 'Code', icon: Cpu, hint: 'Let us write and flash the sketch.' },
-  { id: 'test', label: 'Test', icon: CheckCircle2, hint: 'Run it. I will read the serial output with you.' },
+  { id: 'inspect', label: 'Inspect', icon: ScanLine, hint: 'Show every side so I can spot screws, clips, seams, and risks.' },
+  { id: 'disassemble', label: 'Disassemble', icon: Wrench, hint: 'I will guide one teardown step at a time and watch your progress.' },
+  { id: 'assemble', label: 'Assemble', icon: Cpu, hint: 'I will guide reassembly, cable routing, screws, and connector checks.' },
+  { id: 'validate', label: 'Validate', icon: CheckCircle2, hint: 'We will check safety, fit, leftover parts, and power-on behavior.' },
 ];
 
-const QUICK = [
-  'What part should I place first?',
-  'Is this resistor the right value?',
-  'Check my wiring so far.',
-  'Why is my LED not lighting up?',
+const PRODUCT_OPTIONS: Array<{
+  id: ProductId;
+  title: string;
+  label: string;
+  desc: string;
+  icon: React.ComponentType<{ className?: string }>;
+  cautions: string[];
+}> = [
+  {
+    id: 'mouse',
+    title: 'Computer mouse',
+    label: 'Mouse',
+    desc: 'Buttons, shell clips, wheel, sensor board, cable or battery bay.',
+    icon: MousePointer2,
+    cautions: ['Remove batteries or unplug USB first', 'Watch tiny springs and scroll-wheel parts'],
+  },
+  {
+    id: 'phone',
+    title: 'Mobile phone',
+    label: 'Phone',
+    desc: 'Back cover, display, battery, ribbon cables, camera modules, screws.',
+    icon: Smartphone,
+    cautions: ['Power off first', 'Do not puncture or bend lithium batteries'],
+  },
+  {
+    id: 'cpu',
+    title: 'CPU or desktop computer',
+    label: 'CPU',
+    desc: 'Cabinet panels, motherboard, RAM, storage, cooler, PSU cables.',
+    icon: Cpu,
+    cautions: ['Unplug mains power first', 'Do not open the power supply unit'],
+  },
+  {
+    id: 'custom',
+    title: 'Custom device',
+    label: 'Add new',
+    desc: 'Name any product and the tutor will adapt from what it sees.',
+    icon: SquarePlus,
+    cautions: ['Start with a full outside inspection', 'Stop if you see batteries, mains parts, heat, or swelling'],
+  },
 ];
 
-export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgrade }) => {
-  const build = useMemo(
-    () => BUILD_LIBRARY.find((b) => b.title === buildTitle) ?? BUILD_LIBRARY[0],
-    [buildTitle],
-  );
-
+export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ onUpgrade }) => {
   const wsUrl = useMemo(() => {
     const raw = import.meta.env.VITE_OHMLET_WS_URL || 'ws://localhost:8082';
     return raw.replace(/\/$/, '');
@@ -81,15 +105,20 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
   const { userId } = useIdentity();
   const sessionId = useRef(`live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`).current;
 
-  const [stage, setStage] = useState<Stage>('inventory');
+  const [stage, setStage] = useState<Stage>('inspect');
+  const [productId, setProductId] = useState<ProductId>('mouse');
+  const [customProduct, setCustomProduct] = useState('');
+  const [repairAction, setRepairAction] = useState<RepairAction>('disassemble');
+  const [procedure, setProcedure] = useState<ProcedureStep[]>([]);
+  const [stepIndex, setStepIndex] = useState(0);
+  const [verification, setVerification] = useState<VerificationResult | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [procedureError, setProcedureError] = useState('');
   const [draft, setDraft] = useState('');
   const [snapped, setSnapped] = useState(false);
-  // The captured build photo currently being turned into a 3D twin (#31).
-  const [twinFrame, setTwinFrame] = useState<string | null>(null);
-  const [twinBusy, setTwinBusy] = useState(false);
   const budgetImageState = useState(true); // [ok, setOk] for the 402 art fallback
 
-  const { canGoLive, liveCapMinutes, liveMinutesRemaining, liveSecondsUsed, consumeLiveSeconds, plan } = usePlan(userId);
+  const { canGoLive, liveCapMinutes, liveMinutesRemaining, consumeLiveSeconds, plan } = usePlan(userId);
 
   const {
     state,
@@ -106,8 +135,23 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
     grabFrame,
     sendText,
     sendStageUpdate,
+    sendSessionContext,
     videoRef,
   } = useLiveBridge({ wsUrl, userId, sessionId });
+
+  const selectedProduct = PRODUCT_OPTIONS.find((p) => p.id === productId) ?? PRODUCT_OPTIONS[0];
+  const productName = productId === 'custom' && customProduct.trim() ? customProduct.trim() : selectedProduct.title;
+  const liveTitle = `${productName} ${repairAction === 'assemble' ? 'assembly' : 'disassembly'}`;
+  const currentStep = procedure[stepIndex];
+  const quickPrompts = useMemo(
+    () => [
+      `Inspect this ${productName} and tell me the safest first step.`,
+      `Guide me to ${repairAction} this ${productName} one step at a time.`,
+      'Look closely and tell me what screws, clips, or cables you can see.',
+      'Check whether it is safe before I continue.',
+    ],
+    [productName, repairAction],
+  );
 
   const live = state === 'connected';
   const connecting = state === 'connecting';
@@ -150,6 +194,28 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
     if (!camOn) toggleCam();
   };
 
+  useEffect(() => {
+    let cancelled = false;
+    setStepIndex(0);
+    setVerification(null);
+    setProcedureError('');
+    getAssemblyProcedure(productId, repairAction)
+      .then((steps) => { if (!cancelled) setProcedure(steps); })
+      .catch(() => { if (!cancelled) setProcedureError('No fixed procedure is available for this custom device; the tutor will use inspect-first guidance.'); });
+    return () => { cancelled = true; };
+  }, [productId, repairAction]);
+
+  useEffect(() => {
+    if (!live) return;
+    sendSessionContext({
+      product: productName,
+      productId,
+      action: repairAction,
+      stage,
+    });
+    sendStageUpdate(stage);
+  }, [live, productName, productId, repairAction, stage, sendSessionContext, sendStageUpdate]);
+
   const snapNow = () => {
     captureSnapshot();
     setSnapped(true);
@@ -161,18 +227,31 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
     if (live) sendStageUpdate(s);
   };
 
-  // Capture a clean still of the finished build and hand it to the twin studio.
-  const captureTwin = useCallback(async () => {
-    setTwinBusy(true);
-    const frame = await grabFrame(1024);
-    setTwinBusy(false);
-    if (frame) setTwinFrame(frame);
-  }, [grabFrame]);
-
   const send = (text: string) => {
     if (!text.trim() || !live) return;
     sendText(text, stage);
     setDraft('');
+  };
+
+  const verifyCurrentStep = async () => {
+    if (!currentStep || !camOn || verifying) return;
+    const frame = await grabFrame(1024);
+    if (!frame) {
+      setVerification({ status: 'unclear', expected_step: currentStep.id, observed_action: 'No usable frame', observed_state: 'Unknown', evidence: [], missing: [], next_instruction: 'Turn the camera on and show the current step clearly.', confidence: 0 });
+      return;
+    }
+    setVerifying(true);
+    try {
+      const result = await verifyAssemblyAction({ frame, productId, product: productName, action: repairAction, stepId: currentStep.id, previousState: verification?.observed_state });
+      setVerification(result);
+      if (result.status === 'verified' && stepIndex < procedure.length - 1) {
+        setStepIndex((index) => index + 1);
+      }
+    } catch (error) {
+      setVerification({ status: 'unclear', expected_step: currentStep.id, observed_action: 'Verification unavailable', observed_state: 'Unknown', evidence: [], missing: [], next_instruction: error instanceof Error ? error.message : 'Try again with a clearer view.', confidence: 0 });
+    } finally {
+      setVerifying(false);
+    }
   };
 
   // ── Out of live budget (the upgrade moment, a friendly 402) ──
@@ -227,9 +306,9 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
   // ── Pre-flight (not connected) ──
   if (!live && !connecting) {
     return (
-      <div className="ohmlet-rise mx-auto max-w-3xl">
+      <div className="ohmlet-rise mx-auto max-w-5xl">
         <p className="text-sm font-extrabold uppercase tracking-[0.16em] text-ohmlet-ink-soft">Live tutor</p>
-        <h1 className="mt-1 text-3xl font-black tracking-[-0.02em] md:text-4xl">Build with a tutor that sees your bench.</h1>
+        <h1 className="mt-1 text-3xl font-black tracking-[-0.02em] md:text-4xl">Repair with a tutor that watches your hands.</h1>
 
         <div className="mt-6 overflow-hidden rounded-[1.8rem] border-[3px] border-ohmlet-gold bg-ohmlet-ink text-white shadow-[0_0_40px_rgba(250,204,46,0.18)]">
           <div className="relative grid gap-6 p-8 md:grid-cols-[1.2fr_1fr]">
@@ -237,13 +316,15 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
               <span className="inline-flex items-center gap-1.5 rounded-full border border-ohmlet-gold/40 px-3 py-1 text-[11px] font-black uppercase tracking-wide text-ohmlet-gold">
                 <span className="h-1.5 w-1.5 rounded-full bg-ohmlet-gold" /> Voice + camera
               </span>
-              <h2 className="mt-4 text-2xl font-black">{build.title}</h2>
-              <p className="mt-2 text-sm font-semibold text-white/65">{build.desc}</p>
+              <h2 className="mt-4 text-2xl font-black">{liveTitle}</h2>
+              <p className="mt-2 text-sm font-semibold text-white/65">
+                Show the real object or its parts. The tutor will inspect it continuously and guide one physical step at a time.
+              </p>
               <ul className="mt-5 space-y-2.5">
                 {[
-                  'Open Ohmlet on the device whose camera you want to use, your laptop or your phone',
-                  'Talk to it like a bench partner, hands free',
-                  'It glances at your board and catches mistakes before you power on',
+                  'Use the camera device that can clearly see your desk',
+                  'Talk hands-free while the tutor watches screws, clips, cables, and parts',
+                  'It asks before risky steps and slows down when the view is unclear',
                 ].map((t) => (
                   <li key={t} className="flex items-start gap-2.5 text-sm font-semibold text-white/85">
                     <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-ohmlet-gold" />
@@ -271,18 +352,88 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
           </div>
         </div>
 
-        {/* Parts checklist */}
-        <div className="mt-6 rounded-[1.4rem] border-2 border-ohmlet-line bg-white p-6 shadow-soft">
-          <h3 className="text-sm font-extrabold uppercase tracking-[0.16em] text-ohmlet-ink-soft">What you will need</h3>
-          <div className="mt-4 flex flex-wrap gap-2">
-            {build.parts.map((part) => (
-              <span key={part} className="inline-flex items-center gap-1.5 rounded-full border-2 border-ohmlet-line bg-ohmlet-cream px-3 py-1.5 text-sm font-bold text-ohmlet-ink">
-                <span className="h-1.5 w-1.5 rounded-full bg-ohmlet-gold-deep" />
-                {part}
-              </span>
-            ))}
+        <div className="mt-6 grid gap-4 md:grid-cols-4">
+          {PRODUCT_OPTIONS.map((product) => {
+            const Icon = product.icon;
+            const on = productId === product.id;
+            return (
+              <button
+                key={product.id}
+                type="button"
+                onClick={() => setProductId(product.id)}
+                className={`min-h-[150px] rounded-2xl border-2 p-4 text-left transition-all ${
+                  on
+                    ? 'border-ohmlet-ink bg-ohmlet-gold shadow-press-sm'
+                    : 'border-ohmlet-line bg-white text-ohmlet-ink hover:border-ohmlet-ink'
+                }`}
+              >
+                <Icon className="h-6 w-6" />
+                <p className="mt-3 text-base font-black">{product.label}</p>
+                <p className="mt-1 text-xs font-semibold leading-snug text-ohmlet-ink-soft">{product.desc}</p>
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1fr]">
+          <div className="rounded-[1.4rem] border-2 border-ohmlet-line bg-white p-5 shadow-soft">
+            <h3 className="text-sm font-extrabold uppercase tracking-[0.16em] text-ohmlet-ink-soft">Task</h3>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              {(['disassemble', 'assemble'] as RepairAction[]).map((action) => (
+                <button
+                  key={action}
+                  type="button"
+                  onClick={() => {
+                    setRepairAction(action);
+                    setStage(action);
+                  }}
+                  className={`rounded-2xl border-2 px-4 py-3 text-sm font-black capitalize transition-all ${
+                    repairAction === action
+                      ? 'border-ohmlet-ink bg-ohmlet-gold shadow-press-sm'
+                      : 'border-ohmlet-line bg-ohmlet-cream text-ohmlet-ink-soft hover:border-ohmlet-ink hover:text-ohmlet-ink'
+                  }`}
+                >
+                  {action}
+                </button>
+              ))}
+            </div>
+            {productId === 'custom' && (
+              <input
+                value={customProduct}
+                onChange={(e) => setCustomProduct(e.target.value)}
+                placeholder="Type product name, e.g. keyboard, speaker, router"
+                className="mt-4 w-full rounded-2xl border-2 border-ohmlet-line bg-ohmlet-cream px-4 py-3 text-sm font-semibold text-ohmlet-ink outline-none focus:border-ohmlet-ink"
+              />
+            )}
+          </div>
+
+          <div className="rounded-[1.4rem] border-2 border-ohmlet-line bg-white p-5 shadow-soft">
+            <div className="flex items-center gap-2">
+              <ShieldAlert className="h-5 w-5 text-ohmlet-red" />
+              <h3 className="text-sm font-extrabold uppercase tracking-[0.16em] text-ohmlet-ink-soft">Safety check</h3>
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {selectedProduct.cautions.map((caution) => (
+                <span key={caution} className="inline-flex items-center gap-1.5 rounded-full border-2 border-ohmlet-line bg-ohmlet-cream px-3 py-1.5 text-sm font-bold text-ohmlet-ink">
+                  <span className="h-1.5 w-1.5 rounded-full bg-ohmlet-red" />
+                  {caution}
+                </span>
+              ))}
+            </div>
           </div>
         </div>
+        {procedure.length > 0 && (
+          <div className="mt-5 rounded-[1.4rem] border-2 border-ohmlet-line bg-white p-5 shadow-soft">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-extrabold uppercase tracking-[0.16em] text-ohmlet-ink-soft">Structured procedure</h3>
+                <p className="mt-1 text-sm font-black text-ohmlet-ink">Step 1 of {procedure.length}: {procedure[0].instruction}</p>
+              </div>
+              <span className="rounded-full border-2 border-ohmlet-line bg-ohmlet-cream px-3 py-1 text-xs font-black">Ground truth</span>
+            </div>
+          </div>
+        )}
+        {procedureError && <p className="mt-3 text-sm font-semibold text-ohmlet-ink-soft">{procedureError}</p>}
       </div>
     );
   }
@@ -295,7 +446,7 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
           <span className="inline-flex items-center gap-1.5 rounded-full bg-ohmlet-red px-3 py-1 text-[11px] font-black uppercase tracking-wide text-white">
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" /> {connecting ? 'Connecting' : 'Live'}
           </span>
-          <h1 className="text-xl font-black tracking-tight">{build.title}</h1>
+          <h1 className="text-xl font-black tracking-tight">{liveTitle}</h1>
         </div>
         <div className="flex items-center gap-2">
           {!unlimited && (
@@ -354,7 +505,7 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
                 <>
                   <button
                     onClick={snapNow}
-                    aria-label="Show the tutor my board now"
+                    aria-label="Show the tutor this product now"
                     className={`flex h-12 items-center gap-2 rounded-full border-2 px-4 text-sm font-black transition-all hover:scale-105 ${
                       snapped ? 'border-ohmlet-green bg-ohmlet-green text-white' : 'border-white bg-white text-ohmlet-ink'
                     }`}
@@ -397,31 +548,27 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
             {STAGES.find((s) => s.id === stage)?.hint}
           </p>
 
-          {/* Kit check (#33): the inventory stage verifies parts via the camera. */}
-          {stage === 'inventory' && verifierConfigured() && (
-            <KitCheck build={build} camOn={camOn} grabFrame={grabFrame} />
-          )}
-
-          {/* 3D twin (#31): the post-session artifact, captured from the finished build. */}
-          {stage === 'test' && reporterConfigured() && (
-            <div className="mt-4 flex items-center justify-between gap-3 rounded-2xl border-2 border-ohmlet-line bg-white p-4 shadow-soft">
+          <div className="mt-4 rounded-2xl border-2 border-ohmlet-line bg-white p-4 shadow-soft">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
-                <p className="text-sm font-black tracking-tight text-ohmlet-ink">Capture a 3D twin</p>
-                <p className="mt-0.5 text-xs font-semibold text-ohmlet-ink-soft">
-                  Turn your finished build into a 3D model you can keep and spin.
+                <p className="text-[11px] font-extrabold uppercase tracking-[0.14em] text-ohmlet-ink-soft">Expected action</p>
+                <p className="mt-1 text-sm font-black text-ohmlet-ink">
+                  {currentStep ? `Step ${currentStep.id}: ${currentStep.instruction}` : 'Show the device and ask the tutor to define the next safe step.'}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={captureTwin}
-                disabled={!camOn || twinBusy}
-                className="inline-flex shrink-0 items-center gap-2 rounded-xl border-2 border-ohmlet-ink bg-ohmlet-gold px-3.5 py-2 text-sm font-black text-ohmlet-ink shadow-press-sm transition-all hover:-translate-y-0.5 hover:bg-ohmlet-gold-deep active:translate-y-0 active:shadow-none disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {twinBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Box className="h-4 w-4" strokeWidth={2.5} />}
-                {twinBusy ? 'Capturing' : 'Create twin'}
+              <button type="button" onClick={verifyCurrentStep} disabled={!currentStep || !camOn || verifying} className="shrink-0 rounded-xl border-2 border-ohmlet-ink bg-ohmlet-gold px-3 py-2 text-xs font-black shadow-press-sm disabled:cursor-not-allowed disabled:opacity-40">
+                {verifying ? 'Verifying…' : 'Verify current action'}
               </button>
             </div>
-          )}
+            {verification && (
+              <div className={`mt-3 rounded-xl border-2 px-3 py-3 ${verification.status === 'verified' ? 'border-ohmlet-green bg-[#eafaf0]' : verification.status === 'unsafe' ? 'border-ohmlet-red bg-[#fdece8]' : 'border-ohmlet-gold bg-ohmlet-gold-soft'}`}>
+                <p className="text-xs font-black uppercase tracking-wide">{verification.status}</p>
+                <p className="mt-1 text-sm font-semibold">Expected: Step {verification.expected_step}. Observed: {verification.observed_action}.</p>
+                <p className="mt-1 text-sm font-black">{verification.next_instruction}</p>
+              </div>
+            )}
+          </div>
+
         </div>
 
         {/* Transcript + input */}
@@ -464,7 +611,7 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
 
           {/* Quick prompts */}
           <div className="flex flex-wrap gap-2 border-t border-ohmlet-line px-4 pt-3">
-            {QUICK.map((q) => (
+            {quickPrompts.map((q) => (
               <button
                 key={q}
                 onClick={() => send(q)}
@@ -501,16 +648,6 @@ export const LiveTutorView: React.FC<LiveTutorViewProps> = ({ buildTitle, onUpgr
         </div>
       </div>
 
-      {twinFrame && (
-        <TwinStudio
-          imageBase64={twinFrame}
-          title={build.title}
-          buildId={build.title}
-          sessionId={sessionId}
-          onClose={() => setTwinFrame(null)}
-          onUpgrade={onUpgrade}
-        />
-      )}
     </div>
   );
 };
@@ -532,147 +669,3 @@ const ControlButton: React.FC<{
     {on ? <OnIcon className="h-5 w-5" /> : <OffIcon className="h-5 w-5" />}
   </button>
 );
-
-// ── Kit check (#33) ──
-// The inventory stage's camera verification: grab a still of the bench, ask the
-// vision-verifier to confirm the parts, and show a per-part checklist. A real,
-// working interaction — not a static cue.
-
-const STATUS_META: Record<PartStatus['status'], { icon: React.ComponentType<{ className?: string }>; tint: string; ring: string }> = {
-  present: { icon: CheckCircle2, tint: 'text-ohmlet-green', ring: 'border-ohmlet-green/30 bg-[#eafaf0]' },
-  missing: { icon: XCircle, tint: 'text-ohmlet-red', ring: 'border-ohmlet-red/30 bg-[#fdece8]' },
-  unsure: { icon: CircleHelp, tint: 'text-ohmlet-gold-deep', ring: 'border-ohmlet-gold/40 bg-ohmlet-gold-soft' },
-};
-
-const KitCheck: React.FC<{
-  build: (typeof BUILD_LIBRARY)[number];
-  camOn: boolean;
-  grabFrame: (maxWidth?: number) => Promise<string | null>;
-}> = ({ build, camOn, grabFrame }) => {
-  const [phase, setPhase] = useState<'idle' | 'checking' | 'done' | 'error'>('idle');
-  const [result, setResult] = useState<InventoryResult | null>(null);
-  const [error, setError] = useState('');
-
-  const run = async () => {
-    setPhase('checking');
-    setError('');
-    const frame = await grabFrame();
-    if (!frame) {
-      setError('Turn the camera on and point it at your parts, then run the check.');
-      setPhase('error');
-      return;
-    }
-    try {
-      const res = await verifyInventory(frame, build.parts, build.title);
-      setResult(res);
-      setPhase('done');
-    } catch (e) {
-      setError(e instanceof VerifierError ? e.message : "Couldn't check your kit just now. Please try again.");
-      setPhase('error');
-    }
-  };
-
-  const presentCount = result?.parts.filter((p) => p.status === 'present').length ?? 0;
-
-  return (
-    <div className="mt-4 overflow-hidden rounded-[1.4rem] border-2 border-ohmlet-line bg-white shadow-soft">
-      <div className="flex items-center justify-between gap-3 border-b border-ohmlet-line px-5 py-3.5">
-        <div className="flex items-center gap-2">
-          <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-ohmlet-ink">
-            <ScanLine className="h-4 w-4 text-ohmlet-gold" />
-          </span>
-          <div>
-            <h3 className="text-sm font-black tracking-tight leading-none">Kit check</h3>
-            {result && (
-              <p className="mt-1 text-[11px] font-bold text-ohmlet-ink-soft">
-                {presentCount} of {result.parts.length} parts spotted
-              </p>
-            )}
-          </div>
-        </div>
-        {result && (
-          <span
-            className={`rounded-full border-2 px-3 py-1 text-[11px] font-black uppercase tracking-wide ${
-              result.ready ? 'border-ohmlet-green bg-[#eafaf0] text-ohmlet-green' : 'border-ohmlet-gold bg-ohmlet-gold-soft text-ohmlet-gold-deep'
-            }`}
-          >
-            {result.ready ? 'Ready to wire' : 'Almost there'}
-          </span>
-        )}
-      </div>
-
-      <div className="px-5 py-4">
-        {phase === 'idle' && (
-          <div className="flex flex-col items-center gap-3 py-2 text-center">
-            <p className="text-sm font-semibold text-ohmlet-ink-soft">
-              Lay your parts out where the camera can see them, then scan to confirm your kit.
-            </p>
-            <button
-              onClick={run}
-              disabled={!camOn}
-              className="inline-flex items-center gap-2 rounded-2xl border-[2.5px] border-ohmlet-ink bg-ohmlet-gold px-5 py-2.5 text-sm font-black text-ohmlet-ink shadow-press-sm transition-all enabled:hover:translate-y-[2px] enabled:hover:shadow-none disabled:opacity-40"
-            >
-              <ScanLine className="h-4 w-4" /> Scan my parts
-            </button>
-            {!camOn && <p className="text-[11px] font-bold text-ohmlet-ink-soft">Turn the camera on first.</p>}
-          </div>
-        )}
-
-        {phase === 'checking' && (
-          <div className="flex items-center justify-center gap-2.5 py-6 text-sm font-bold text-ohmlet-ink-soft">
-            <Loader2 className="h-5 w-5 animate-spin text-ohmlet-gold-deep" /> Checking your kit...
-          </div>
-        )}
-
-        {phase === 'error' && (
-          <div className="flex flex-col items-center gap-3 py-2 text-center">
-            <p className="text-sm font-semibold text-ohmlet-red">{error}</p>
-            <button
-              onClick={run}
-              className="inline-flex items-center gap-2 rounded-2xl border-2 border-ohmlet-ink bg-white px-4 py-2 text-sm font-black text-ohmlet-ink shadow-press-sm transition-all hover:translate-y-[2px] hover:shadow-none"
-            >
-              <RefreshCw className="h-4 w-4" /> Try again
-            </button>
-          </div>
-        )}
-
-        {phase === 'done' && result && (
-          <div className="space-y-3">
-            <p className="text-sm font-semibold text-ohmlet-ink">{result.feedback}</p>
-            <ul className="space-y-2">
-              {result.parts.map((p) => {
-                const meta = STATUS_META[p.status];
-                const Icon = meta.icon;
-                return (
-                  <li key={p.name} className={`flex items-start gap-2.5 rounded-xl border px-3 py-2 ${meta.ring}`}>
-                    <Icon className={`mt-0.5 h-4 w-4 shrink-0 ${meta.tint}`} />
-                    <div className="min-w-0">
-                      <p className="text-sm font-bold text-ohmlet-ink">{p.name}</p>
-                      {p.note && <p className="text-[11px] font-semibold text-ohmlet-ink-soft">{p.note}</p>}
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-            {result.found_extras.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] font-bold uppercase tracking-wide text-ohmlet-ink-soft">Also spotted</span>
-                {result.found_extras.map((e) => (
-                  <span key={e} className="rounded-full border border-ohmlet-line bg-ohmlet-cream px-2 py-0.5 text-[11px] font-bold text-ohmlet-ink-soft">
-                    {e}
-                  </span>
-                ))}
-              </div>
-            )}
-            <button
-              onClick={run}
-              className="inline-flex items-center gap-2 rounded-2xl border-2 border-ohmlet-ink bg-white px-4 py-2 text-sm font-black text-ohmlet-ink shadow-press-sm transition-all hover:translate-y-[2px] hover:shadow-none"
-            >
-              <RefreshCw className="h-4 w-4" /> Scan again
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
